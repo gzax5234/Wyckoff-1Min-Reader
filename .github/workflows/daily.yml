@@ -1,10 +1,9 @@
-name: Daily Stock AI Report (BJT 12:00 & 16:00 + Telegram DM)
+name: Daily Stock AI Report (BJT 12:00 & 16:00 + Telegram 
 
-on:
+on: 
   workflow_dispatch:
   schedule:
-    - cron: "0 4 * * *"   # UTC 04:00 = BJT 12:00
-    - cron: "0 8 * * *"   # UTC 08:00 = BJT 16:00
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
