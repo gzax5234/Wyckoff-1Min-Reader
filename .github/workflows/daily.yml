@@ -1,10 +1,10 @@
 name: Daily Stock AI Report
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:      # 允许手动触发
   schedule:
     # UTC 04:00 = 北京时间 12:00 (午盘)
-    - cron: "0 4 * * *"    
+    - cron: "0 4 * * *"   
     # UTC 07:15 = 北京时间 15:15 (收盘后)
     - cron: "15 7 * * *"   
 
@@ -29,19 +29,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies    
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # 显式安装核心库，确保环境稳健
+          pip install pandas akshare mplfinance openai requests
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run Analysis Script
         env:
+          # === 核心配置 ===
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          SYMBOL: "600970" # 你可以在这里修改默认监控的股票
+          # 必须传递这个 Secret，否则 main.py 会报错
+          WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
+          SYMBOL: "600970" 
+          BARS_COUNT: "600"
         run: |
+          # 确保目录存在
+          mkdir -p data reports
           python main.py
 
-      # === 新增：清理旧文件 (只保留最近7天) ===
+      # === 清理旧文件 (只保留最近7天) ===
       - name: Cleanup old data
         run: |
           echo "Cleaning up files older than 7 days..."
@@ -74,8 +82,7 @@ jobs:
         run: |
           set -euo pipefail
           export LANG=C.UTF-8
-          export LC_ALL=C.UTF-8
-
+          
           echo "=== 1. 查找文件 ==="
           # 使用 find 查找最新的 md 和 png
           REPORT_FILE=$(find reports -name "*.md" -type f -printf "%T@ %p\n" | sort -n | tail -1 | cut -d' ' -f2-)
@@ -89,54 +96,63 @@ jobs:
           echo "Found Report: $REPORT_FILE"
 
           echo "=== 2. 准备中间文件 ==="
-          # 2.1 处理图片：复制到 /tmp 目录，确保路径简单且无权限问题
+          # 2.1 处理图片：复制到 /tmp 目录
           HAS_IMAGE=false
           if [ -n "${CHART_FILE:-}" ] && [ -f "$CHART_FILE" ]; then
              cp "$CHART_FILE" /tmp/chart.png
              echo "Image copied to /tmp/chart.png"
-             ls -lh /tmp/chart.png
              HAS_IMAGE=true
           else
              echo "No image found."
           fi
 
-          # 2.2 处理文案：写入临时文件，避免 Shell 变量转义问题
-          # python 的输出直接重定向到 caption.txt
+          # 2.2 处理文案：生成 caption.txt
+          # 传递 GitHub Server URL 和 Repository
           python - "$REPORT_FILE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" <<'PY' > /tmp/caption.txt
           import pathlib, sys
           
           path = sys.argv[1]
+          server_url = sys.argv[2]
+          repo = sys.argv[3]
+          
           try:
               text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
               lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
               
+              # 提取标题 (去除Markdown #)
               title = lines[0].lstrip("#").strip() if lines else "AI Analysis"
+              
+              # 提取正文 (跳过第一行标题和第二行可能的图片链接)
+              # 我们假设正文从第3行开始，取前40行做摘要
               body_lines = lines[2:40]
-              # Telegram Caption 限制 1024 字符，保险起见截取 900
               summary = "\n".join(body_lines)[:900]
               
               # 构造 HTML 格式消息
-              msg = f"<b>{title}</b>\n\n{summary}\n\n... <a href='https://github.com/{sys.argv[2]}/{sys.argv[3]}'>查看完整版</a>"
+              # 链接格式: https://github.com/用户名/仓库名
+              full_url = f"{server_url}/{repo}"
+              msg = f"<b>{title}</b>\n\n{summary}\n\n... <a href='{full_url}'>查看完整版</a>"
               print(msg)
           except Exception as e:
               print(f"Error parsing report: {e}")
           PY
           
-          echo "Caption saved to /tmp/caption.txt (Size: $(wc -c < /tmp/caption.txt) bytes)"
+          # 将 caption 读取到环境变量中 (解决 curl 读取文件的问题)
+          CAPTION_TEXT=$(cat /tmp/caption.txt)
+          echo "Caption generated."
 
           echo "=== 3. 发送请求 ==="
-          # 3.1 根据是否有图选择发送方式
           if [ "$HAS_IMAGE" = true ]; then
             echo "Sending Photo..."
-            curl -v -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" \
+            # 注意：使用 -F 传递 caption 字段
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" \
               -F "chat_id=${TG_CHAT_ID}" \
               -F "photo=@/tmp/chart.png" \
               -F "parse_mode=HTML" \
-              -F "caption=</tmp/caption.txt"
+              -F "caption=${CAPTION_TEXT}"
           else
             echo "Sending Text..."
-            curl -v -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               -d "chat_id=${TG_CHAT_ID}" \
               -d "parse_mode=HTML" \
-              --data-urlencode "text=$(cat /tmp/caption.txt)"
+              --data-urlencode "text=${CAPTION_TEXT}"
           fi
